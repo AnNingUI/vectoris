@@ -26,6 +26,7 @@ npm install vectoris
 ```typescript
 import { Ast as d } from "vectoris"; // DSL stands for AST
 import { compileWasm } from "vectoris";
+import { WorkerPool } from "vectoris";
 
 // Define a simple kernel that adds a value to each element in an array
 const kernel = d.module("map_kernel", [
@@ -68,9 +69,6 @@ const view = createInt32View(memory);
 
 // Initialize data
 for (let i = 0; i < COUNT; i++) view[i] = i;
-
-// Execute the kernel with multi-threading
-import { WorkerPool } from "vectoris";
 
 const pool = new WorkerPool({ concurrency: 4 });
 await pool.init();
