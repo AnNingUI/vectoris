@@ -4,6 +4,8 @@ import {
 	Node,
 	ValueType,
 	block,
+	br,
+	brTable,
 	f32Load,
 	f32Store,
 	f64Load,
@@ -22,7 +24,6 @@ import {
 	i32Store8,
 	i64Load,
 	i64Store,
-	ifNode,
 } from "../dsl/ast";
 
 // ==========================================
@@ -274,7 +275,7 @@ export class EnumDef<V extends EnumVariants> {
 	public at(basePtr: Node): EnumInstance<V> {
 		// [FIX 2] Removed 'const self = this' alias.
 		// Using arrow functions for methods to capture 'this' automatically.
-		return {
+		const instance: EnumInstance<V> = {
 			$ptr: basePtr,
 
 			tag: () => {
@@ -302,6 +303,11 @@ export class EnumDef<V extends EnumVariants> {
 				return structDef.at(payloadPtr);
 			},
 		};
+
+		// Register instance for match() to access EnumDef
+		enumInstanceToDefMap.set(instance, this);
+
+		return instance;
 	}
 }
 
@@ -319,44 +325,157 @@ type MatchCases<V extends EnumVariants> = {
 	) => Node | Node[];
 };
 
+/**
+ * Pattern matching using WASM br_table instruction.
+ *
+ * This implementation follows the WASM specification and Rust's compilation strategy:
+ * - Uses br_table for O(1) dispatch based on enum tag
+ * - Generates a jump table structure similar to Rust's match compilation
+ *
+ * WASM br_table semantics:
+ * - br_table [l0, l1, ...] l_default pops an i32 index
+ * - If index=0, branch to l0; index=1, branch to l1; etc.
+ * - If index >= len, branch to l_default
+ * - br jumps to the END of the target block (not the beginning)
+ *
+ * Generated structure (for 2 variants: Idle=0, Running=1):
+ * ```wasm
+ * (block $match_end (result T)
+ *   (block $case_1           ;; depth 1 from br_table
+ *     (block $case_0         ;; depth 2 from br_table
+ *       (block $default      ;; depth 3 from br_table
+ *         (br_table $case_0 $case_1 $default (tag))
+ *       )
+ *       ;; default case body (falls through after $default block ends)
+ *       (br $match_end)
+ *     )
+ *     ;; case 0 body (Idle)
+ *     (br $match_end)
+ *   )
+ *   ;; case 1 body (Running) - last case, falls through to match_end
+ * )
+ * ```
+ */
 export function match<V extends EnumVariants>(
 	enumInst: EnumInstance<V>,
 	cases: MatchCases<V>,
 	defaultCase?: () => Node[],
 	resultType?: ValueType
 ): Node {
-	const entries = Object.entries(cases);
+	// Get the EnumDef from the instance to access tagMap
+	const enumDef = getEnumDefFromInstance(enumInst);
+	const variantNames = Object.keys(enumDef.variants);
+	const maxTag = variantNames.length;
 
-	const buildChain = (index: number): Node => {
-		if (index >= entries.length) {
-			if (defaultCase) {
-				const nodes = defaultCase();
-				return block(
-					"default_case",
-					Array.isArray(nodes) ? nodes : [nodes],
-					resultType
-				);
-			}
-			return block("no_match_noop", [], resultType);
+	// Build label names
+	const caseLabels: string[] = [];
+	for (let i = 0; i < maxTag; i++) {
+		caseLabels.push(`case_${i}`);
+	}
+	const defaultLabel = "default";
+	const endLabel = "match_end";
+
+	// Map tag index to variant name
+	const tagToVariant = new Map<number, string>();
+	for (const [name, tag] of Object.entries(enumDef.tagMap)) {
+		tagToVariant.set(tag as number, name);
+	}
+
+	// br_table labels: for index i, we want to jump to case_i block's end
+	// The blocks are nested: $match_end > $case_{N-1} > ... > $case_0 > $default
+	// So from br_table's perspective (inside $default):
+	// - $default is depth 0
+	// - $case_0 is depth 1
+	// - $case_1 is depth 2
+	// - ...
+	// - $case_{N-1} is depth N
+	// - $match_end is depth N+1
+	const brTableLabels: string[] = [];
+	for (let i = 0; i < maxTag; i++) {
+		brTableLabels.push(caseLabels[i]!);
+	}
+
+	// Helper to get case body for a variant
+	const getCaseBody = (tagIndex: number): Node[] => {
+		const variantName = tagToVariant.get(tagIndex);
+		const handler = variantName ? cases[variantName as keyof V] : undefined;
+
+		if (handler) {
+			const payload = enumInst.as(variantName as keyof V);
+			const result = (handler as Function)(payload);
+			return normalizeNodes(result);
 		}
-
-		const [variantName, handler] = entries[index]!;
-		// @ts-ignore
-		const handlerFn = handler as Function;
-
-		const condition = enumInst.is(variantName);
-		const payload = enumInst.as(variantName);
-
-		let consequentNodes = handlerFn(payload);
-		if (!Array.isArray(consequentNodes)) consequentNodes = [consequentNodes];
-
-		const alternateNode = buildChain(index + 1);
-
-		return ifNode(condition, consequentNodes, [alternateNode], resultType);
+		// No handler - fall through to default behavior (empty body, will hit br to end)
+		return [];
 	};
 
-	return buildChain(0);
+	// Build nested blocks from inside out
+	// Innermost: $default block with br_table
+	let current: Node = block(
+		defaultLabel,
+		[brTable(brTableLabels, defaultLabel, enumInst.tag())],
+		"void"
+	);
+
+	// After $default block ends, we're in the default case
+	// Add default case body, then br to end
+	const defaultBody = defaultCase ? normalizeNodes(defaultCase()) : [];
+	current = block(
+		caseLabels[0]!,
+		[current, ...defaultBody, br(endLabel)],
+		"void"
+	);
+
+	// Wrap with case blocks from case_0 to case_{N-1}
+	for (let i = 0; i < maxTag; i++) {
+		const caseBody = getCaseBody(i);
+		const isLastCase = i === maxTag - 1;
+
+		if (isLastCase) {
+			// Last case - wrap with match_end, no br needed (falls through)
+			current = block(endLabel, [current, ...caseBody], resultType);
+		} else {
+			// Not last case - wrap with next case label, add br to end
+			current = block(
+				caseLabels[i + 1]!,
+				[current, ...caseBody, br(endLabel)],
+				"void"
+			);
+		}
+	}
+
+	return current;
 }
+
+/**
+ * Helper to normalize handler results to Node[]
+ */
+function normalizeNodes(result: Node | Node[]): Node[] {
+	if (Array.isArray(result)) return result;
+	return [result];
+}
+
+/**
+ * Extract EnumDef from EnumInstance.
+ * This is a workaround since EnumInstance doesn't directly expose the EnumDef.
+ */
+function getEnumDefFromInstance<V extends EnumVariants>(
+	inst: EnumInstance<V>
+): EnumDef<V> {
+	// We need to access the EnumDef that created this instance
+	// Since EnumInstance is created by EnumDef.at(), we need to store a reference
+	// For now, we'll use a WeakMap to track this relationship
+	const def = enumInstanceToDefMap.get(inst);
+	if (!def) {
+		throw new Error(
+			"EnumInstance not registered. Make sure to use EnumDef.at() to create instances."
+		);
+	}
+	return def as EnumDef<V>;
+}
+
+// WeakMap to track EnumInstance -> EnumDef relationship
+const enumInstanceToDefMap = new WeakMap<EnumInstance<any>, EnumDef<any>>();
 
 // ==========================================
 // 5. Array / Slice Helper

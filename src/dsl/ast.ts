@@ -121,7 +121,7 @@ export interface BaseNode {
 	name?: string;
 
 	// Values & Types
-	value?: number | bigint | string | number[]; // For consts, br_table labels, etc.
+	value?: number | bigint | string | number[] | string[]; // For consts, br_table labels, etc.
 	valueType?: ValueType;
 
 	// Memory / Struct args
@@ -264,6 +264,25 @@ export function br(label: string): Node {
 }
 export function brIf(label: string, condition: Node): Node {
 	return { type: "br_if", name: label, children: [condition], value: label };
+}
+
+/**
+ * br_table - Multi-way branch instruction
+ * @param labels - Array of label names for each case (index 0, 1, 2, ...)
+ * @param defaultLabel - Default label when index is out of bounds
+ * @param index - The index value node (i32) to branch on
+ */
+export function brTable(
+	labels: string[],
+	defaultLabel: string,
+	index: Node
+): Node {
+	return {
+		type: "br_table",
+		value: labels as string[], // Store labels array
+		name: defaultLabel, // Store default label
+		children: [index], // Index expression
+	};
 }
 export function call(name: string, args: Node[] = []): Node {
 	return { type: "call", name, children: args };

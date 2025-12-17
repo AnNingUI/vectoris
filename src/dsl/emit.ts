@@ -370,6 +370,21 @@ export class WasmBinaryEmitter {
 
 		if (node.type === "br" || node.type === "br_if") {
 			w.u32(fCtx.getRelativeDepth(node.name || (node.value as string)));
+		} else if (node.type === "br_table") {
+			// br_table encoding: vec(labelidx) labelidx_default
+			const labels = node.value as unknown as string[];
+			const defaultLabel = node.name || "";
+
+			// Write number of labels (not including default)
+			w.u32(labels.length);
+
+			// Write each label index
+			labels.forEach((label) => {
+				w.u32(fCtx.getRelativeDepth(label));
+			});
+
+			// Write default label index
+			w.u32(fCtx.getRelativeDepth(defaultLabel));
 		} else if (node.type === "call") {
 			const funcName = node.name || "";
 			let funcIdx = this.ctx.funcIndexMap.get(funcName);

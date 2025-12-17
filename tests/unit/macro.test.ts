@@ -112,4 +112,54 @@ describe("Macro System", () => {
 		view[1] = 555; // Payload at offset 4
 		expect((instance.exports.check as Function)(0)).toBe(555);
 	});
+
+	it("should handle multi-variant enum with br_table correctly", () => {
+		// Test with 3+ variants to ensure br_table dispatch works correctly
+		const TrafficLight = Enum({
+			Red: null,
+			Yellow: null,
+			Green: null,
+		});
+
+		const m = d.module("test_traffic", [
+			d.importMemory("env", "memory", { min: 1 }),
+			d.func(
+				"get_wait_time",
+				[d.param("ptr", "i32")],
+				[d.result("i32")],
+				[],
+				[
+					match(
+						TrafficLight.at(d.localGet("ptr")),
+						{
+							Red: () => [d.i32Const(30)],    // Wait 30 seconds
+							Yellow: () => [d.i32Const(5)],  // Wait 5 seconds
+							Green: () => [d.i32Const(0)],   // Go immediately
+						},
+						() => [d.i32Const(-1)], // Unknown state
+						"i32"
+					),
+				]
+			),
+			d.exportFunc("get_wait_time"),
+		]);
+
+		const mem = new WebAssembly.Memory({ initial: 1 });
+		const instance = instantiateWasmSync(m, { env: { memory: mem } });
+		const view = new Int32Array(mem.buffer);
+
+		// Test all variants
+		view[0] = 0; // Red
+		expect((instance.exports.get_wait_time as Function)(0)).toBe(30);
+
+		view[0] = 1; // Yellow
+		expect((instance.exports.get_wait_time as Function)(0)).toBe(5);
+
+		view[0] = 2; // Green
+		expect((instance.exports.get_wait_time as Function)(0)).toBe(0);
+
+		// Test out-of-bounds (should hit default)
+		view[0] = 99;
+		expect((instance.exports.get_wait_time as Function)(0)).toBe(-1);
+	});
 });
